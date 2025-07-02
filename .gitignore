@@ -1,0 +1,19 @@
+# Virtual environments
+chatenv/
+env/
+venv/
+.venv/
+vpaenv/
+.vpaenv/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# VS Code
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
