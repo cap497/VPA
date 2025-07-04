@@ -4,3 +4,6 @@ openai>=1.0.0
 faiss-cpu
 numpy
 rank_bm25
+flask
+twilio
+pyngrok

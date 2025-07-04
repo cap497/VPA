@@ -12,7 +12,7 @@ BM25_OUT = "bm25_index"
 MAX_PARAGRAPH_GROUP_TOKENS = 200
 
 # ✅ Hard-coded target model name
-TARGET_MODEL_NAME = "tinyllama-1.1b-chat-v1.0"
+TARGET_MODEL_NAME = "meta-llama-3-8b-instruct"
 
 
 # --------------------------------------------------------------------------------
