@@ -1,7 +1,5 @@
 # Virtual env
-env/
 venv/
-.venv/
 
 # Vehicle data files
 assets_out/
@@ -9,14 +7,3 @@ indices/
 
 # Python cache
 __pycache__/
-*.pyc
-
-# Environment variables
-*.env
-
-# VS Code
-.vscode/
-
-# System files
-.DS_Store
-Thumbs.db
