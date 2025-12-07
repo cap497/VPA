@@ -6,10 +6,12 @@ from typing import Any, Dict, List, Optional, Sequence, Mapping, Iterable
 from sensors.can_store import CANStore
 from random import random
 from threading import Thread
+import tempfile, whisper
+import requests
 
 from flask import (
     Flask, request, jsonify, render_template,
-    send_from_directory, abort
+    send_from_directory, abort, Response
 )
 
 # ===== Sensores: import funções públicas =====
@@ -27,8 +29,69 @@ from sensors import (
 # ===== RAG núcleo =====
 from query_core import (
     load_assets_index, load_bm25_index, load_faiss_index,
-    run_rag_pipeline, ensure_idle_monitor
+    run_rag_pipeline, ensure_idle_monitor,
+    retrieve_with_bm25, retrieve_with_faiss,
+    rerank_with_embeddings, select_final_context,
+    collect_page_images,
+    stream_llm_answer,
+    LMSTUDIO_BASE, LMSTUDIO_MODEL, LMSTUDIO_API_KEY,
 )
+
+def lmstudio_stream_answer(context: str, question: str):
+    """
+    Lê o LM Studio em modo streaming (OpenAI compatível) e
+    vai yieldando pedaços de texto.
+    """
+    url = f"{LMSTUDIO_BASE}/chat/completions"
+    headers = {"Authorization": f"Bearer {LMSTUDIO_API_KEY}"}
+    payload = {
+        "model": LMSTUDIO_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Responda em português, de forma concisa e objetiva. "
+                    "Use apenas o contexto fornecido."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Pergunta: {question}\n\nContexto:\n{context}",
+            },
+        ],
+        "temperature": 0.2,
+        "max_tokens": 300,
+        "stream": True,
+    }
+
+    try:
+        with requests.post(url, headers=headers, json=payload, stream=True, timeout=0) as r:
+            r.raise_for_status()
+            for raw_line in r.iter_lines():
+                if not raw_line:
+                    continue
+                line = raw_line.strip()
+                # formato OpenAI: "data: {...}"
+                if line.startswith(b"data:"):
+                    line = line[len(b"data:"):].strip()
+                if not line:
+                    continue
+                if line == b"[DONE]":
+                    break
+                try:
+                    evt = _json.loads(line.decode("utf-8"))
+                except Exception:
+                    continue
+                delta = evt["choices"][0]["delta"].get("content") or ""
+                if delta:
+                    yield delta
+    except Exception:
+        # fallback simples: devolve contexto "extrativo" inteiro de uma vez
+        ctx = (context or "").strip()
+        if ctx:
+            yield "Aqui está o que encontrei com base no manual:\n\n" + ctx[:1500]
+        else:
+            yield "Não encontrei informações suficientes no contexto."
 
 # -----------------------------------------------------------------------------
 # App & Config
@@ -48,6 +111,11 @@ MODEL_MAP = {
 def normalize_model(name: str) -> str:
     if not name: return ""
     return MODEL_MAP.get(name.strip().lower(), name.strip().lower())
+
+# -----------------------------------------------------------------------------
+# Loading ASR model
+# -----------------------------------------------------------------------------
+ASR_MODEL = whisper.load_model("base")
 
 # -----------------------------------------------------------------------------
 # Helpers defensivos para SENSORS
@@ -342,6 +410,37 @@ def chat_ui():
     return render_template("chat.html")
 
 # -----------------------------------------------------------------------------
+# ASR endpoint
+# -----------------------------------------------------------------------------
+@app.route("/asr", methods=["POST"])
+def asr():
+    if "audio" not in request.files:
+        return jsonify({"ok": False, "error": "no audio"}), 400
+
+    audio_file = request.files["audio"]
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
+        tmp_path = tmp.name
+        audio_file.save(tmp_path)
+
+    try:
+        result = ASR_MODEL.transcribe(tmp_path, language="pt")
+        text = (result.get("text") or "").strip()
+
+        return jsonify({"ok": True, "text": text})
+
+    except Exception as e:
+        # Mostra o erro no console e devolve para o front para debug
+        print("Erro no ASR:", repr(e))
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    finally:
+        try:
+            os.remove(tmp_path)
+        except:
+            pass
+
+# -----------------------------------------------------------------------------
 # RAG endpoint
 # -----------------------------------------------------------------------------
 @app.route("/ask", methods=["POST"])
@@ -389,6 +488,84 @@ def ask():
 
     images = [f"/assets/{slug}/{_strip_prefixes(p, slug)}" for p in rel_images]
     return jsonify({"answer": answer, "images": images, "model": slug})
+
+# -----------------------------------------------------------------------------
+# RAG endpoint - streaming
+# -----------------------------------------------------------------------------
+@app.route("/ask_stream", methods=["POST"])
+def ask_stream():
+    data = request.get_json(force=True) or {}
+    question = (data.get("question") or "").strip()
+    vehicle_model = (data.get("vehicleModel") or "").strip()
+    max_tokens = int(data.get("maxContextTokens") or 500)
+
+    if not question:
+        def _err():
+            yield _json.dumps({"type": "error", "error": "Pergunta vazia."}) + "\n"
+        return Response(_err(), mimetype="application/jsonl")
+
+    slug = normalize_model(vehicle_model)
+    if not slug:
+        def _err():
+            yield _json.dumps({"type": "error", "error": "Selecione um modelo de veículo."}) + "\n"
+        return Response(_err(), mimetype="application/jsonl")
+
+    try:
+        ensure_model_loaded(slug)
+    except FileNotFoundError as e:
+        def _err():
+            yield _json.dumps({
+                "type": "error",
+                "error": f"Modelo '{vehicle_model}' não disponível: {e}"
+            }) + "\n"
+        return Response(_err(), mimetype="application/jsonl")
+
+    assets_index = _ASSETS_CACHE[slug]
+    bm25, docs_meta, faiss_index, faiss_ids = _INDEX_CACHE[slug]
+
+    # ---------- RAG: igual à lógica do run_rag_pipeline, mas pegando o contexto ----------
+    query = (vehicle_model + " " + question).strip() if vehicle_model else question
+
+    bm25_top = retrieve_with_bm25(bm25, docs_meta, query, top_n=200)
+    faiss_top = retrieve_with_faiss(faiss_index, faiss_ids, docs_meta, query, k=200)
+    shortlist = [i for i in bm25_top if i in set(faiss_top)]
+    if not shortlist:
+        shortlist = bm25_top[:50]
+
+    reranked = rerank_with_embeddings(shortlist, docs_meta, query, top_k=20, threshold=0.30)
+    context, chosen = select_final_context(reranked, docs_meta, max_context_tokens=max_tokens)
+
+    # páginas e imagens relevantes
+    pages = []
+    for i in chosen:
+        p = docs_meta[i]["page"]
+        if p not in pages:
+            pages.append(p)
+    rel_images_raw = collect_page_images(pages, assets_index, limit=6)
+
+    def _strip_prefixes(p: str, slug: str) -> str:
+        p = (p or "").replace("\\", "/").lstrip("./")
+        while p.startswith(slug + "/"):
+            p = p[len(slug) + 1:]
+        for prefix in ("assets_out/", "./assets_out/"):
+            pref = f"{prefix}{slug}/"
+            if p.startswith(pref):
+                p = p[len(pref):]
+        return p
+
+    images = [f"/assets/{slug}/{_strip_prefixes(p, slug)}" for p in rel_images_raw]
+
+    # ---------- Stream para o cliente ----------
+    def generate():
+        # primeiro evento: imagens
+        yield _json.dumps({"type": "images", "images": images}, ensure_ascii=False) + "\n"
+        # depois, texto em partes
+        for delta in stream_llm_answer(context, question):
+            yield _json.dumps({"type": "delta", "text": delta}, ensure_ascii=False) + "\n"
+        # fim
+        yield _json.dumps({"type": "done"}, ensure_ascii=False) + "\n"
+
+    return Response(generate(), mimetype="application/jsonl")
 
 # -----------------------------------------------------------------------------
 # Assets extraídos

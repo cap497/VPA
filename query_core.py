@@ -16,7 +16,7 @@ EMB_MODEL_NAME = os.environ.get("EMB_MODEL_NAME", "sentence-transformers/all-Min
 
 # LM Studio (OpenAI-compatible) — if not available, fallback to extractive answer
 LMSTUDIO_BASE = os.environ.get("OPENAI_API_BASE", "http://localhost:1234/v1")
-LMSTUDIO_MODEL = os.environ.get("TARGET_MODEL_NAME", "meta-llama-3-8b-instruct")
+LMSTUDIO_MODEL = os.environ.get("TARGET_MODEL_NAME", "llama-3.2-3b-instruct")
 LMSTUDIO_API_KEY = os.environ.get("OPENAI_API_KEY", "not-needed")
 
 IDLE_UNLOAD_SECS = int(os.environ.get("IDLE_UNLOAD_SECS", "1800"))  # 30min
@@ -154,7 +154,6 @@ def select_final_context(doc_ids: List[int], docs_meta: List[Dict[str, Any]], ma
 def generate_llm_answer(context: str, question: str) -> str:
     global _last_use_ts
     _last_use_ts = time.time()
-    # If LM Studio is reachable, use it via OpenAI-compatible API.
     try:
         import requests
         url = f"{LMSTUDIO_BASE}/chat/completions"
@@ -162,22 +161,87 @@ def generate_llm_answer(context: str, question: str) -> str:
         payload = {
             "model": LMSTUDIO_MODEL,
             "messages": [
-                {"role": "system", "content": "Responda em português, de forma concisa e objetiva. Use apenas o contexto fornecido."},
+                {"role": "system", "content":
+                    "Responda em português, de forma concisa e objetiva. "
+                    "Use apenas o contexto fornecido. "
+                    "O usuário é um motorista dirigindo um veículo. "
+                    "A resposta deve ter no máximo 50 palavras."
+                 },
                 {"role": "user", "content": f"Pergunta: {question}\n\nContexto:\n{context}"}
             ],
-            "temperature": 0.2,
-            "max_tokens": 300
+            "temperature": 0.1,
+            "max_tokens": 200
+            # sem 'stream' aqui → resposta inteira
         }
+
         r = requests.post(url, headers=headers, json=payload, timeout=30)
         r.raise_for_status()
         data = r.json()
         msg = data["choices"][0]["message"]["content"].strip()
         return msg
-    except Exception as e:
+
+    except Exception:
         # Fallback: devolve o contexto "extractive"
         if context.strip():
             return "Aqui está o que encontrei com base no manual:\n\n" + context[:1500]
         return "Não encontrei informações suficientes no contexto."
+
+def stream_llm_answer(context: str, question: str):
+    """
+    Versão em streaming: yield de pedaços de texto (tokens) vindos do LM Studio.
+    """
+    global _last_use_ts
+    _last_use_ts = time.time()
+    import requests, json
+
+    url = f"{LMSTUDIO_BASE}/chat/completions"
+    headers = {"Authorization": f"Bearer {LMSTUDIO_API_KEY}"}
+    payload = {
+        "model": LMSTUDIO_MODEL,
+        "messages": [
+            {"role": "system", "content":
+                "Responda em português, de forma concisa e objetiva. "
+                "Use apenas o contexto fornecido. "
+                "O usuário é um motorista dirigindo um veículo. "
+                "A resposta deve ter no máximo 50 palavras."
+             },
+            {"role": "user", "content": f"Pergunta: {question}\n\nContexto:\n{context}"}
+        ],
+        "temperature": 0.1,
+        "max_tokens": 200,
+        "stream": True,
+    }
+
+    try:
+        with requests.post(url, headers=headers, json=payload, stream=True, timeout=None) as r:
+            r.raise_for_status()
+            for raw in r.iter_lines():
+                if not raw:
+                    continue
+
+                line = raw.strip()
+                # LM Studio segue o formato OpenAI: "data: {...}"
+                if line.startswith(b"data:"):
+                    line = line[len(b"data:"):].strip()
+
+                if not line:
+                    continue
+                if line == b"[DONE]":
+                    break
+
+                try:
+                    evt = json.loads(line.decode("utf-8"))
+                    delta = evt["choices"][0]["delta"].get("content")
+                    if delta:
+                        yield delta
+                except Exception:
+                    continue
+    except Exception:
+        # fallback pequeno
+        if context.strip():
+            yield "Aqui está o que encontrei com base no manual:\n\n" + context[:1500]
+        else:
+            yield "Não encontrei informações suficientes no contexto."
 
 # ---------------- Page → images ----------------
 def collect_page_images(pages: List[int], assets_index: Dict[str, Any], limit: int = 6) -> List[str]:

@@ -251,6 +251,11 @@
       font-weight: bold;
     }
 
+    #micBtn.recording {
+      background: #d9534f !important;
+      border-color: #d9534f !important;
+    }
+
   </style>
 </head>
 
@@ -380,6 +385,19 @@
 
       <footer class="composer">
         <input id="userInput" type="text" placeholder="Digite sua pergunta..." />
+
+        <!-- 🔊 Botão de microfone -->
+        <button id="micBtn" type="button" style="
+            padding: 10px 16px;
+            border: 1px solid #666;
+            background: #666;
+            color: #fff;
+            border-radius: 10px;
+            cursor: pointer;
+        ">
+          🎤
+        </button>
+
         <button id="sendBtn">Enviar</button>
       </footer>
     </main>
@@ -430,6 +448,7 @@
       const wrap = document.createElement('div');
       wrap.className = 'message ' + sender;
 
+      // bolha de texto (sem animação – para mensagens do usuário)
       if (payload.text) {
         const p = document.createElement('div');
         p.className = 'bubble';
@@ -437,6 +456,7 @@
         wrap.appendChild(p);
       }
 
+      // galeria de imagens (se houver)
       if (payload.images && payload.images.length) {
         const gallery = document.createElement('div');
         gallery.className = 'gallery';
@@ -456,6 +476,53 @@
       container.scrollTop = container.scrollHeight;
     }
 
+    function addBotStreamingMessage(text, images) {
+      const container = document.getElementById('messages');
+
+      // wrapper e bolha
+      const wrap = document.createElement('div');
+      wrap.className = 'message bot';
+
+      const bubble = document.createElement('div');
+      bubble.className = 'bubble';
+      bubble.textContent = ''; // começa vazia
+      wrap.appendChild(bubble);
+
+      // galeria de imagens (se existir)
+      if (images && images.length) {
+        const gallery = document.createElement('div');
+        gallery.className = 'gallery';
+        images.forEach(src => {
+          const a = document.createElement('a'); a.href = src; a.target = '_blank';
+          const img = document.createElement('img');
+          img.src = src; img.alt = 'asset';
+          img.loading = 'lazy';
+          img.onerror = () => { img.alt = 'imagem não encontrada'; a.classList.add('broken'); };
+          a.appendChild(img);
+          gallery.appendChild(a);
+        });
+        wrap.appendChild(gallery);
+      }
+
+      container.appendChild(wrap);
+      container.scrollTop = container.scrollHeight;
+
+      // animação palavra por palavra
+      const parts = text.split(/(\s+)/); // mantém espaços
+      let idx = 0;
+
+      function step() {
+        if (idx >= parts.length) return;
+        bubble.textContent += parts[idx];
+        idx++;
+        container.scrollTop = container.scrollHeight;
+        setTimeout(step, 40); // ajuste a velocidade aqui (ms)
+      }
+
+      // pequeno delay inicial (≈ 1s) antes de começar a “digitar”
+      setTimeout(step, 1000);
+    }
+
     async function sendMessage() {
       const input = document.getElementById('userInput');
       const btn   = document.getElementById('sendBtn');
@@ -463,13 +530,19 @@
       const maxTokens = 500; // mantido simples aqui
 
       if (!message) return;
-      if (!currentVehicleModel) { addMessage({text: 'Selecione um modelo antes de perguntar.'}, 'bot'); return; }
+      if (!currentVehicleModel) {
+        addMessage({text: 'Selecione um modelo antes de perguntar.'}, 'bot');
+        return;
+      }
 
+      // mensagem do usuário
       addMessage({text: message}, 'user');
       input.value = '';
 
       const loadedBefore = await checkLMStatusOnce();
-      if (!loadedBefore) addMessage({text: 'O modelo local está carregando. Aguarde alguns instantes...'}, 'bot');
+      if (!loadedBefore) {
+        addMessage({text: 'O modelo local está carregando. Aguarde alguns instantes...'}, 'bot');
+      }
 
       showDots();
       let warnedUnload = false;
@@ -480,20 +553,103 @@
         }
       });
 
-      input.disabled = true; btn.disabled = true;
+      input.disabled = true;
+      btn.disabled   = true;
+
       try {
-        const res = await fetch('/ask', {
+        const res = await fetch('/ask_stream', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ question: message, vehicleModel: currentVehicleModel, maxContextTokens: maxTokens })
+          body: JSON.stringify({
+            question: message,
+            vehicleModel: currentVehicleModel,
+            maxContextTokens: maxTokens
+          })
         });
-        const data = await res.json();
-        addMessage({text: data.answer || 'Sem resposta.', images: data.images || []}, 'bot');
+
+        if (!res.ok || !res.body) {
+          addMessage({text: 'Falha ao iniciar streaming de resposta.'}, 'bot');
+          return;
+        }
+
+        const reader  = res.body.getReader();
+        const decoder = new TextDecoder();
+
+        // cria a mensagem do bot vazia onde vamos anexar tokens
+        const container = document.getElementById('messages');
+        const wrap   = document.createElement('div');
+        wrap.className = 'message bot';
+        const bubble = document.createElement('div');
+        bubble.className = 'bubble';
+        bubble.textContent = '';
+        wrap.appendChild(bubble);
+        container.appendChild(wrap);
+        container.scrollTop = container.scrollHeight;
+
+        let buffer = '';
+        let galleryCreated = false;
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+
+          let idx;
+          while ((idx = buffer.indexOf('\n')) >= 0) {
+            const line = buffer.slice(0, idx).trim();
+            buffer = buffer.slice(idx + 1);
+            if (!line) continue;
+
+            let evt;
+            try {
+              evt = JSON.parse(line);
+            } catch (e) {
+              console.error('Erro parse streaming:', e, line);
+              continue;
+            }
+
+            if (evt.type === 'images') {
+              const imgs = evt.images || [];
+              if (imgs.length && !galleryCreated) {
+                galleryCreated = true;
+                const gallery = document.createElement('div');
+                gallery.className = 'gallery';
+                imgs.forEach(src => {
+                  const a = document.createElement('a');
+                  a.href = src; a.target = '_blank';
+                  const img = document.createElement('img');
+                  img.src = src;
+                  img.alt = 'asset';
+                  img.loading = 'lazy';
+                  img.onerror = () => {
+                    img.alt = 'imagem não encontrada';
+                    a.classList.add('broken');
+                  };
+                  a.appendChild(img);
+                  gallery.appendChild(a);
+                });
+                wrap.appendChild(gallery);
+              }
+            } else if (evt.type === 'delta') {
+              bubble.textContent += evt.text;
+              container.scrollTop = container.scrollHeight;
+            } else if (evt.type === 'error') {
+              bubble.textContent += '\n[erro: ' + (evt.error || 'desconhecido') + ']';
+            } else if (evt.type === 'done') {
+              // nada a fazer
+            }
+          }
+        }
+
       } catch (err) {
-        addMessage({text: 'Falha de rede.'}, 'bot');
+        console.error(err);
+        addMessage({text: 'Falha de rede durante streaming.'}, 'bot');
       } finally {
-        hideDots(); stopStatusPolling();
-        input.disabled = false; btn.disabled = false; input.focus();
+        hideDots();
+        stopStatusPolling();
+        input.disabled = false;
+        btn.disabled   = false;
+        input.focus();
       }
     }
 
@@ -802,6 +958,88 @@
       drawLineChart(cvsLongA, seriesLongA, { min:-6, max:6, title:'Aceleração Longitudinal (m/s²)', unit:'m/s²', yLabels:'minmax' });
       drawLineChart(cvsLatA,  seriesLatA, { min:-6, max:6, title:'Aceleração Lateral (m/s²)',      unit:'m/s²', yLabels:'minmax' });
     });
+
+    /* ==================== Voz (Web Speech API) ==================== */
+
+    const micBtn = document.getElementById("micBtn");
+    const userInput = document.getElementById("userInput");
+    let mediaRecorder = null;
+    let audioChunks = [];
+    let isRecording = false;
+
+    async function startRecording() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        mediaRecorder = new MediaRecorder(stream);
+
+        audioChunks = [];
+        mediaRecorder.ondataavailable = (e) => {
+          if (e.data.size > 0) audioChunks.push(e.data);
+        };
+
+        mediaRecorder.onstop = () => {
+          const blob = new Blob(audioChunks, { type: "audio/webm" });
+          sendAudioToASR(blob);
+        };
+
+        mediaRecorder.start();
+        isRecording = true;
+        micBtn.classList.add("recording");
+        micBtn.textContent = "⏹"; // muda ícone durante gravação
+      } catch (err) {
+        console.error("Erro ao iniciar microfone:", err);
+        alert("Não foi possível acessar o microfone.");
+      }
+    }
+
+    function stopRecording() {
+      if (mediaRecorder && isRecording) {
+        mediaRecorder.stop();
+        isRecording = false;
+        micBtn.classList.remove("recording");
+        micBtn.textContent = "🎤";
+      }
+    }
+
+    micBtn.addEventListener("click", () => {
+      if (!isRecording) startRecording();
+      else stopRecording();
+    });
+
+    // --- Envia para /asr ---
+    async function sendAudioToASR(audioBlob) {
+      const formData = new FormData();
+      formData.append("audio", audioBlob, "audio.webm");
+
+      try {
+        const res = await fetch("/asr", {
+          method: "POST",
+          body: formData,
+        });
+
+        const data = await res.json();
+        if (!data.ok) {
+          alert("Não foi possível transcrever o áudio.");
+          return;
+        }
+
+        const text = data.text.trim();
+        if (!text) {
+          alert("Não entendi o áudio. Tente novamente.");
+          return;
+        }
+
+        userInput.value = text;
+
+        // se quiser que envie automaticamente:
+        // document.getElementById("sendBtn").click();
+
+      } catch (err) {
+        console.error("Erro no ASR:", err);
+        alert("Erro ao processar o áudio.");
+      }
+    }
+
   </script>
 </body>
 </html>
