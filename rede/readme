@@ -1,0 +1,108 @@
+# Protocolo de Comunicação Cliente-Servidor para Transmissão de Pesos de Rede Neural
+
+Este documento descreve um protocolo binário mínimo para comunicação entre um cliente (eventualmente uma FPGA) e um servidor. A comunicação é bidirecional e permite a transmissão eficiente de vetores de pesos de redes neurais (float32).
+
+## 📡 Visão Geral
+
+- Protocolo: TCP/IP (recomendado para confiabilidade e ordem)
+- Tipo de dados: binário puro
+- Formato dos dados: `float32` (4 bytes por peso)
+- Quantidade fixa de pesos: 190
+- Comunicação: **bidirecional** e assíncrona (qualquer lado pode enviar a qualquer momento)
+
+---
+
+## 📦 Estrutura do Pacote
+
+Cada mensagem enviada segue o seguinte layout binário:
+
+| Campo                | Tamanho (bytes) | Tipo        | Descrição                                                      |
+|---------------------|-----------------|-------------|-----------------------------------------------------------------|
+| Magic Header        | 2               | uint16      | Valor fixo `0xABCD` para marcar o início de um pacote           |
+| Opcode              | 1               | uint8       | Código da operação (veja tabela de opcodes abaixo)             |
+| Quantidade de Pesos | 2               | uint16      | Número de pesos enviados (geralmente 190)                      |
+| Dados               | 4 × N           | float32[N]  | Vetor de pesos de ponto flutuante de 32 bits                   |
+
+### ✅ Exemplo típico:
+- 190 pesos de float32 = 190 × 4 = 760 bytes
+- Total do pacote = 2 + 1 + 2 + 760 = **765 bytes**
+
+---
+
+## 🧾 Tabela de Opcodes
+
+| Opcode | Significado              |
+|--------|--------------------------|
+| 0x01   | Envio de pesos           |
+| 0x02   | Resposta/Ack             |
+| 0x03   | Erro ou pacote inválido  |
+| 0x04   | Solicita envio de pesos  |
+| 0x05   | Envio de metricas        |
+
+
+
+Opcodes adicionais podem ser definidos no futuro conforme necessário.
+
+---
+
+## 🧠 Considerações Técnicas
+
+- **Endianess**: todos os campos devem usar **little-endian**  
+- **Conexão**: TCP persistente (o socket permanece aberto para múltiplas trocas)  
+- **Validação**: o campo Magic Header (`0xABCD`) é usado para garantir que os pacotes estão bem formados  
+- **Threading/Síncrono**: para suportar envio e recebimento arbitrário, cada lado deve ser capaz de **ler e escrever simultaneamente**
+
+---
+
+## 💬 Fluxo de Comunicação
+
+### Exemplo 1: FPGA envia pesos
+1. FPGA cria pacote com opcode `0x01`, 190 pesos
+2. Servidor recebe, valida e armazena
+3. Servidor envia resposta opcional com opcode `0x02`
+
+### Exemplo 2: Servidor envia novos pesos
+1. Servidor envia pacote `0x01`, com pesos atualizados
+2. FPGA recebe e aplica
+3. FPGA responde com `0x02` ou ignora se for unidirecional
+
+---
+
+## 🔐 Segurança e Integridade (futuro)
+
+- Checksum/CRC para verificação de integridade (não incluso nesta versão)
+- Autenticação/criptografia se necessário (TLS, chaves públicas etc)
+
+---
+
+## 🧪 Testes Locais
+
+Antes da integração com a FPGA, recomenda-se:
+
+- Implementar cliente de testes em Python (simula a FPGA)
+- Implementar servidor TCP em Python
+- Enviar/receber pacotes conforme estrutura descrita
+- Validar consistência dos dados recebidos
+
+---
+
+## 📎 Anexos
+
+### Estrutura em Python com `struct`:
+
+```python
+import struct
+
+# Definindo a estrutura
+HEADER_FORMAT = "<H B H"  # Magic (2 bytes), Opcode (1), Quantidade (2)
+HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
+
+# Criando pacote com 190 pesos
+magic = 0xABCD
+opcode = 0x01
+qtd_pesos = 190
+pesos = [0.1] * 190  # exemplo
+
+header = struct.pack(HEADER_FORMAT, magic, opcode, qtd_pesos)
+body = struct.pack("<" + "f" * qtd_pesos, *pesos)
+packet = header + body
